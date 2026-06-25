@@ -42,147 +42,137 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout caller repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Detect changed files
+      - name: Get changed agent files
         id: changed-files
         uses: actions/github-script@v7
         with:
           script: |
-            const isAgentFile = (f) => /^(agents|\.github\/agents)\/.*\.md$/.test(f);
-            const isSkillFile = (f) => /skills\/.+/.test(f);
-            let changed = [];
+            const isAgentFile = (filename) => /^(agents|\.github\/agents)\/.*\.md$/.test(filename);
+            const isSkillFile = (filename) => /skills\/.+/.test(filename);
+            let changedFiles = [];
 
             if (context.eventName === 'pull_request') {
-              const { data: files } = await github.rest.pulls.listFiles({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: context.issue.number,
-              });
-              changed = files.map(f => f.filename);
+              let page = 1;
+              let hasMore = true;
+              while (hasMore) {
+                const { data: files } = await github.rest.pulls.listFiles({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: context.issue.number,
+                  per_page: 100,
+                  page: page,
+                });
+                changedFiles = changedFiles.concat(files.map(f => f.filename));
+                hasMore = files.length === 100;
+                page++;
+              }
+            } else if (context.eventName === 'workflow_call' && `${{ inputs.pr_number || '' }}`.trim() !== '') {
+              let page = 1;
+              let hasMore = true;
+              while (hasMore) {
+                const { data: files } = await github.rest.pulls.listFiles({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: Number(`${{ inputs.pr_number }}`),
+                  per_page: 100,
+                  page: page,
+                });
+                changedFiles = changedFiles.concat(files.map(f => f.filename));
+                hasMore = files.length === 100;
+                page++;
+              }
             } else if (context.eventName === 'push') {
-              const { data: compare } = await github.rest.repos.compareCommits({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                base: context.payload.before,
-                head: context.payload.after,
-              });
-              changed = (compare.files || []).map(f => f.filename);
+              const before = context.payload.before;
+              const after = context.payload.after;
+
+              if (before && after) {
+                const { data: compare } = await github.rest.repos.compareCommits({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  base: before,
+                  head: after,
+                });
+                changedFiles = (compare.files || []).map(f => f.filename);
+              }
             }
 
-            const agents = changed.filter(isAgentFile).join(' ');
-            const skills = changed.filter(isSkillFile).join(' ');
+            const inputFiles = `${{ inputs.files || '' }}`.trim();
+            if (inputFiles !== '' && (context.eventName === 'workflow_call' || context.eventName === 'workflow_dispatch')) {
+              const explicitFiles = inputFiles.split(/\s+/);
+              changedFiles = Array.from(new Set([...changedFiles, ...explicitFiles]));
+            }
 
-            core.setOutput('agent_files', agents);
-            core.setOutput('skill_files', skills);
-            console.log('Changed agents:', agents || 'none');
-            console.log('Changed skills:', skills || 'none');
+            const agentFiles = changedFiles.filter(isAgentFile);
+            const skillFiles = changedFiles.filter(isSkillFile);
 
-      - name: Validate skills — GitHub CLI dry-run
+            console.log('Changed agent files:', agentFiles);
+            console.log('Changed skill files:', skillFiles);
+            core.setOutput('files', agentFiles.join(' '));
+            core.setOutput('skill_files', skillFiles.join(' '));
+
+      - name: Validate skills with gh skill publish --dry-run
         id: validate_skills_cli
         if: steps.changed-files.outputs.skill_files != ''
         run: |
           report="skill-cli-validation-report.md"
+          echo "# Skill Validation — GitHub CLI Dry-Run" > "$report"
+          echo "" >> "$report"
+          echo "**Command used:** \`gh skill publish --dry-run\`" >> "$report"
+          echo "" >> "$report"
           
-          echo "# Skill Validation — GitHub CLI Dry-Run Check" > "$report"
-          echo "" >> "$report"
-          echo "**Primary validation method:** \`gh skill publish --dry-run\`" >> "$report"
-          echo "" >> "$report"
-          echo "This check validates:" >> "$report"
-          echo "- Required YAML fields (name, description, license)" >> "$report"
-          echo "- Folder structure and naming conventions" >> "$report"
-          echo "- Repository configuration (topic tags, secret scanning)" >> "$report"
-          echo "- File scannable and installable status" >> "$report"
-          echo "" >> "$report"
-          echo "---" >> "$report"
-          echo "" >> "$report"
-
           failed=0
-          passed=0
-
-          # Loop through each changed skill file
-          while read -r skill_path; do
-            [ -z "$skill_path" ] && continue
-            
-            skill_dir=$(dirname "$skill_path")
+          for skill_file in ${{ steps.changed-files.outputs.skill_files }}; do
+            skill_dir=$(dirname "$skill_file")
             skill_name=$(basename "$skill_dir")
             
-            echo "## Skill: $skill_name" >> "$report"
+            echo "## $skill_name" >> "$report"
+            cd "$skill_dir"
+            if gh skill publish --dry-run >> "$report" 2>&1; then
+              echo "✅ PASSED" >> "$report"
+            else
+              echo "❌ FAILED" >> "$report"
+              ((failed++))
+            fi
             echo "" >> "$report"
-            
-            # Navigate to skill folder and run validation
-            (
-              cd "$skill_dir"
-              if gh skill publish --dry-run > /tmp/cli-output.txt 2>&1; then
-                echo "✅ **Status:** PASSED" >> "$report"
-                ((passed++))
-              else
-                echo "❌ **Status:** FAILED" >> "$report"
-                ((failed++))
-              fi
-            )
-            
-            echo "" >> "$report"
-            echo "<details>" >> "$report"
-            echo "<summary>CLI Output</summary>" >> "$report"
-            echo "" >> "$report"
-            echo "\`\`\`" >> "$report"
-            cat /tmp/cli-output.txt >> "$report" 2>/dev/null || echo "No output" >> "$report"
-            echo "\`\`\`" >> "$report"
-            echo "" >> "$report"
-            echo "</details>" >> "$report"
-            echo "" >> "$report"
-            
-          done <<< "${{ steps.changed-files.outputs.skill_files }}"
-
-          echo "## Summary" >> "$report"
-          echo "- ✅ Passed: $passed" >> "$report"
-          echo "- ❌ Failed: $failed" >> "$report"
+            cd - > /dev/null
+          done
           
           if [ $failed -gt 0 ]; then
             exit 1
           fi
 
-      - name: Run validator (if you have composite action)
-        id: validate_agents
-        if: steps.changed-files.outputs.agent_files != ''
-        uses: ./.github/actions/validate-agents
-        with:
-          files: ${{ steps.changed-files.outputs.agent_files }}
-        continue-on-error: true
+      - name: Skip validation (no relevant file changes)
+        if: steps.changed-files.outputs.files == '' && steps.changed-files.outputs.skill_files == ''
+        run: echo "No changed agent or skill files detected; validation skipped."
 
-      - name: Post validation results to PR
-        if: always() && github.event_name == 'pull_request'
+      - name: Post PR comment
+        if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_call') && (steps.changed-files.outputs.files != '' || steps.changed-files.outputs.skill_files != '')
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
             const sections = [];
-
-            // Read skill CLI report
+            
             if (fs.existsSync('skill-cli-validation-report.md')) {
-              const skillReport = fs.readFileSync('skill-cli-validation-report.md', 'utf8');
-              sections.push(skillReport);
+              const content = fs.readFileSync('skill-cli-validation-report.md', 'utf8');
+              sections.push(content);
             }
 
             if (sections.length === 0) {
-              sections.push('No validation reports generated.');
+              sections.push('Validation completed.');
             }
 
-            const body = `<!-- validation-reports -->\n${sections.join('\n\n---\n\n')}`;
-            const marker = '<!-- validation-reports -->';
-            
+            const body = `<!-- validation-reports -->\n${sections.join('\n\n')}`;
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
 
-            const existing = comments.find(c => c.body.includes(marker));
-
+            const existing = comments.find(c => c.body.includes('<!-- validation-reports -->'));
             if (existing) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
@@ -199,15 +189,14 @@ jobs:
               });
             }
 
-      - name: Upload reports as artifacts
-        if: always()
+      - name: Upload validation artifacts
+        if: always() && steps.changed-files.outputs.skill_files != ''
         uses: actions/upload-artifact@v4
         with:
-          name: validation-reports
+          name: copilot-validation-reports
           if-no-files-found: ignore
-          path: |
-            skill-cli-validation-report.md
+          path: skill-cli-validation-report.md
 
-      - name: Fail if skills validation failed
+      - name: Fail if validation failed
         if: failure() && steps.validate_skills_cli.outcome == 'failure'
         run: exit 1
