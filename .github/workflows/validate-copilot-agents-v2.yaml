@@ -1,0 +1,213 @@
+name: Validate Copilot Agents V2
+
+on:
+  workflow_dispatch:
+    inputs:
+      files:
+        description: "Optional space-separated list of agent files to validate"
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      files:
+        description: "Optional space-separated list of agent files to validate"
+        required: false
+        type: string
+      pr_number:
+        description: "PR number to post the comment on"
+        required: false
+        type: number
+  pull_request:
+    paths:
+      - "agents/**"
+      - ".github/agents/**"
+      - ".github/skills/**"
+      - ".github/workflows/**"
+  push:
+    branches:
+      - main
+    paths:
+      - "agents/**"
+      - ".github/agents/**"
+      - ".github/skills/**"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  validate-agents:
+    name: Validate agent profiles
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed files
+        id: changed-files
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const isAgentFile = (f) => /^(agents|\.github\/agents)\/.*\.md$/.test(f);
+            const isSkillFile = (f) => /skills\/.+/.test(f);
+            let changed = [];
+
+            if (context.eventName === 'pull_request') {
+              const { data: files } = await github.rest.pulls.listFiles({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+              });
+              changed = files.map(f => f.filename);
+            } else if (context.eventName === 'push') {
+              const { data: compare } = await github.rest.repos.compareCommits({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                base: context.payload.before,
+                head: context.payload.after,
+              });
+              changed = (compare.files || []).map(f => f.filename);
+            }
+
+            const agents = changed.filter(isAgentFile).join(' ');
+            const skills = changed.filter(isSkillFile).join(' ');
+
+            core.setOutput('agent_files', agents);
+            core.setOutput('skill_files', skills);
+            console.log('Changed agents:', agents || 'none');
+            console.log('Changed skills:', skills || 'none');
+
+      - name: Validate skills — GitHub CLI dry-run
+        id: validate_skills_cli
+        if: steps.changed-files.outputs.skill_files != ''
+        run: |
+          report="skill-cli-validation-report.md"
+          
+          echo "# Skill Validation — GitHub CLI Dry-Run Check" > "$report"
+          echo "" >> "$report"
+          echo "**Primary validation method:** \`gh skill publish --dry-run\`" >> "$report"
+          echo "" >> "$report"
+          echo "This check validates:" >> "$report"
+          echo "- Required YAML fields (name, description, license)" >> "$report"
+          echo "- Folder structure and naming conventions" >> "$report"
+          echo "- Repository configuration (topic tags, secret scanning)" >> "$report"
+          echo "- File scannable and installable status" >> "$report"
+          echo "" >> "$report"
+          echo "---" >> "$report"
+          echo "" >> "$report"
+
+          failed=0
+          passed=0
+
+          # Loop through each changed skill file
+          while read -r skill_path; do
+            [ -z "$skill_path" ] && continue
+            
+            skill_dir=$(dirname "$skill_path")
+            skill_name=$(basename "$skill_dir")
+            
+            echo "## Skill: $skill_name" >> "$report"
+            echo "" >> "$report"
+            
+            # Navigate to skill folder and run validation
+            (
+              cd "$skill_dir"
+              if gh skill publish --dry-run > /tmp/cli-output.txt 2>&1; then
+                echo "✅ **Status:** PASSED" >> "$report"
+                ((passed++))
+              else
+                echo "❌ **Status:** FAILED" >> "$report"
+                ((failed++))
+              fi
+            )
+            
+            echo "" >> "$report"
+            echo "<details>" >> "$report"
+            echo "<summary>CLI Output</summary>" >> "$report"
+            echo "" >> "$report"
+            echo "\`\`\`" >> "$report"
+            cat /tmp/cli-output.txt >> "$report" 2>/dev/null || echo "No output" >> "$report"
+            echo "\`\`\`" >> "$report"
+            echo "" >> "$report"
+            echo "</details>" >> "$report"
+            echo "" >> "$report"
+            
+          done <<< "${{ steps.changed-files.outputs.skill_files }}"
+
+          echo "## Summary" >> "$report"
+          echo "- ✅ Passed: $passed" >> "$report"
+          echo "- ❌ Failed: $failed" >> "$report"
+          
+          if [ $failed -gt 0 ]; then
+            exit 1
+          fi
+
+      - name: Run validator (if you have composite action)
+        id: validate_agents
+        if: steps.changed-files.outputs.agent_files != ''
+        uses: ./.github/actions/validate-agents
+        with:
+          files: ${{ steps.changed-files.outputs.agent_files }}
+        continue-on-error: true
+
+      - name: Post validation results to PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const sections = [];
+
+            // Read skill CLI report
+            if (fs.existsSync('skill-cli-validation-report.md')) {
+              const skillReport = fs.readFileSync('skill-cli-validation-report.md', 'utf8');
+              sections.push(skillReport);
+            }
+
+            if (sections.length === 0) {
+              sections.push('No validation reports generated.');
+            }
+
+            const body = `<!-- validation-reports -->\n${sections.join('\n\n---\n\n')}`;
+            const marker = '<!-- validation-reports -->';
+            
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Upload reports as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-reports
+          if-no-files-found: ignore
+          path: |
+            skill-cli-validation-report.md
+
+      - name: Fail if skills validation failed
+        if: failure() && steps.validate_skills_cli.outcome == 'failure'
+        run: exit 1
