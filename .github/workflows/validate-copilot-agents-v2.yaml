@@ -14,7 +14,7 @@ on:
         required: false
         type: string
       pr_number:
-        description: "PR number to post the comment on"
+        description: "PR number to post the comment on (pass github.event.pull_request.number from the caller)"
         required: false
         type: number
   pull_request:
@@ -22,6 +22,8 @@ on:
       - "agents/**"
       - ".github/agents/**"
       - ".github/skills/**"
+      - ".github/actions/validate-agents/**"
+      - "scripts/**"
       - ".github/workflows/**"
   push:
     branches:
@@ -30,6 +32,8 @@ on:
       - "agents/**"
       - ".github/agents/**"
       - ".github/skills/**"
+      - ".github/actions/validate-agents/**"
+      - "scripts/**"
       - ".github/workflows/**"
 
 permissions:
@@ -44,6 +48,8 @@ jobs:
     steps:
       - name: Checkout caller repository
         uses: actions/checkout@v4
+
+      # Removed: cross-repo checkout and token usage
 
       - name: Get changed agent files
         id: changed-files
@@ -113,41 +119,54 @@ jobs:
             core.setOutput('files', agentFiles.join(' '));
             core.setOutput('skill_files', skillFiles.join(' '));
 
-      - name: Validate skills with gh skill publish --dry-run
-        id: validate_skills_cli
+      - name: Run gh skill publish --dry-run validation
+        id: gh_skill_validate
         if: steps.changed-files.outputs.skill_files != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          report="skill-cli-validation-report.md"
-          echo "# Skill Validation — GitHub CLI Dry-Run" > "$report"
-          echo "" >> "$report"
-          echo "**Command used:** \`gh skill publish --dry-run\`" >> "$report"
-          echo "" >> "$report"
-          
-          failed=0
-          for skill_file in ${{ steps.changed-files.outputs.skill_files }}; do
-            skill_dir=$(dirname "$skill_file")
-            skill_name=$(basename "$skill_dir")
-            
-            echo "## $skill_name" >> "$report"
-            cd "$skill_dir"
-            if gh skill publish --dry-run >> "$report" 2>&1; then
-              echo "✅ PASSED" >> "$report"
-            else
-              echo "❌ FAILED" >> "$report"
-              ((failed++))
-            fi
-            echo "" >> "$report"
-            cd - > /dev/null
-          done
-          
-          if [ $failed -gt 0 ]; then
-            exit 1
+          SKILL_FILES="${{ steps.changed-files.outputs.skill_files }}"
+          # Extract unique skill names from changed file paths
+          SKILL_DIRS=$(echo "$SKILL_FILES" | tr ' ' '\n' | sed -n 's|.*skills/\([^/]*\)/.*|\1|p' | sort -u)
+          if [ -z "$SKILL_DIRS" ]; then
+            echo "No skill directories identified. Skipping."
+            exit 0
           fi
+          echo "Changed skills detected: $SKILL_DIRS"
+          FAILED=0
+          for SKILL in $SKILL_DIRS; do
+            SKILL_PATH=".github/skills/$SKILL"
+            if [ -d "$SKILL_PATH" ]; then
+              echo "--- Validating skill: $SKILL ---"
+              (cd "$SKILL_PATH" && gh skill publish --dry-run) || { echo "❌ Skill '$SKILL' failed validation."; FAILED=1; }
+            else
+              echo "⚠️ Directory '$SKILL_PATH' not found, skipping."
+            fi
+          done
+          if [ $FAILED -ne 0 ]; then exit 1; fi
+        continue-on-error: true
+
+      - name: Run validator (composite action local)
+        id: validate_local
+        if: github.repository == 'fractalcopilot/gh-copilot-adoption-framework' && (steps.changed-files.outputs.files != '' || steps.changed-files.outputs.skill_files != '')
+        uses: ./.github/actions/validate-agents
+        with:
+          files: ${{ steps.changed-files.outputs.files }}
+          skill_files: ${{ steps.changed-files.outputs.skill_files }}
+        continue-on-error: true
+
+      - name: Run validator (composite action reusable)
+        id: validate_reusable
+        if: github.repository != 'fractalcopilot/gh-copilot-adoption-framework' && (steps.changed-files.outputs.files != '' || steps.changed-files.outputs.skill_files != '')
+        uses: fractalcopilot/gh-copilot-adoption-framework/.github/actions/validate-agents@main
+        with:
+          files: ${{ steps.changed-files.outputs.files }}
+          skill_files: ${{ steps.changed-files.outputs.skill_files }}
+        continue-on-error: true
 
       - name: Skip validation (no relevant file changes)
         if: steps.changed-files.outputs.files == '' && steps.changed-files.outputs.skill_files == ''
         run: echo "No changed agent or skill files detected; validation skipped."
-
       - name: Post PR comment
         if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_call') && (steps.changed-files.outputs.files != '' || steps.changed-files.outputs.skill_files != '')
         uses: actions/github-script@v7
@@ -155,24 +174,100 @@ jobs:
           script: |
             const fs = require('fs');
             const sections = [];
-            
-            if (fs.existsSync('skill-cli-validation-report.md')) {
-              const content = fs.readFileSync('skill-cli-validation-report.md', 'utf8');
-              sections.push(content);
-            }
+            const snapshotRows = [];
+
+            const extractStatus = (content) => {
+              if (content.includes('> [!CAUTION]')) {
+                return '❌ Action needed';
+              }
+              if (content.includes('> [!WARNING]')) {
+                return '⚠️ Review';
+              }
+              if (content.includes('> [!NOTE]')) {
+                return '✅ Pass';
+              }
+              if (content.includes('❌')) {
+                return '❌ Action needed';
+              }
+              if (content.includes('⚠️')) {
+                return '⚠️ Review';
+              }
+              return 'ℹ️ Info';
+            };
+
+            const extractSummaryLine = (content) => {
+              const lines = content.split('\n').map(l => l.trim()).filter(Boolean);
+              const boldSummary = lines.find(l => /^\*\*.*\*\*\s*—/.test(l));
+              if (boldSummary) {
+                return boldSummary;
+              }
+
+              const overallSummaryIndex = lines.findIndex(l => /^###\s+Overall\s+Summary$/i.test(l));
+              if (overallSummaryIndex >= 0 && lines[overallSummaryIndex + 1]) {
+                return lines[overallSummaryIndex + 1];
+              }
+
+              const summaryIndex = lines.findIndex(l => /^###\s+Summary$/i.test(l));
+              if (summaryIndex >= 0 && lines[summaryIndex + 1]) {
+                return lines[summaryIndex + 1];
+              }
+
+              return 'Summary available in expanded section.';
+            };
+
+            const addCollapsibleSection = (title, path) => {
+              if (!fs.existsSync(path)) {
+                return;
+              }
+
+              const content = fs.readFileSync(path, 'utf8');
+              const status = extractStatus(content);
+              const summary = extractSummaryLine(content);
+
+              snapshotRows.push(`| ${title} | ${status} | ${summary.replace(/\|/g, '\\|')} |`);
+
+              sections.push(
+                `<details>\n<summary><strong>${title}</strong> — ${status}</summary>\n\n${content}\n\n</details>`
+              );
+            };
+
+            addCollapsibleSection('Copilot Agent Validation Results', 'validation-report.md');
+            addCollapsibleSection('Prompt Injection Results', 'prompt-injection-report.md');
+            addCollapsibleSection('Token Usage Analysis', 'token-analysis-report.md');
+            addCollapsibleSection('Skill Benchmark Results', 'skill_benchmark_report.md');
 
             if (sections.length === 0) {
-              sections.push('Validation completed.');
+              sections.push('Validation completed, but no markdown report files were found.');
             }
 
-            const body = `<!-- validation-reports -->\n${sections.join('\n\n')}`;
+            const snapshot = snapshotRows.length
+              ? [
+                  '## Quick Summary',
+                  '',
+                  '| Report | Status | Summary |',
+                  '|--------|--------|---------|',
+                  ...snapshotRows,
+                ].join('\n')
+              : '';
+
+            const report = [snapshot, sections.join('\n\n---\n\n')].filter(Boolean).join('\n\n');
+            const marker = '<!-- copilot-agent-validation -->';
+            const body = `${marker}\n${report}`;
+
+            const prNumber = context.issue.number || ${{ inputs.pr_number || 0 }};
+            if (!prNumber) {
+              console.log('No PR number available; skipping comment.');
+              return;
+            }
+
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
+              issue_number: prNumber,
             });
 
-            const existing = comments.find(c => c.body.includes('<!-- validation-reports -->'));
+            const existing = comments.find(c => c.body.includes(marker));
+
             if (existing) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
@@ -184,19 +279,22 @@ jobs:
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: context.issue.number,
+                issue_number: prNumber,
                 body,
               });
             }
+      - name: Fail if validation failed
+        if: steps.validate_local.outcome == 'failure' || steps.validate_reusable.outcome == 'failure'
+        run: exit 1
 
       - name: Upload validation artifacts
-        if: always() && steps.changed-files.outputs.skill_files != ''
+        if: always() && (steps.changed-files.outputs.files != '' || steps.changed-files.outputs.skill_files != '')
         uses: actions/upload-artifact@v4
         with:
           name: copilot-validation-reports
           if-no-files-found: ignore
-          path: skill-cli-validation-report.md
-
-      - name: Fail if validation failed
-        if: failure() && steps.validate_skills_cli.outcome == 'failure'
-        run: exit 1
+          path: |
+            validation-report.md
+            prompt-injection-report.md
+            token-analysis-report.md
+            skill_benchmark_report.md
